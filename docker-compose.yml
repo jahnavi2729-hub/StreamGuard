@@ -1,0 +1,105 @@
+services:
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+    volumes:
+      - ./kafka/data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - kafka-topics --bootstrap-server localhost:29092 --list >/dev/null 2>&1
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 60s
+
+  spark:
+    image: apache/spark:3.5.5
+    container_name: spark-kafka-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /tmp/ivy2 /opt/delta_lake/bronze/market_trades &&
+        exec /opt/spark/bin/spark-submit
+        --master 'local[*]'
+        --conf spark.jars.ivy=/tmp/ivy2
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,io.delta:delta-spark_2.12:3.2.0
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        /opt/spark-app/kafka_consumer.py
+    volumes:
+      - ./spark_streaming:/opt/spark-app:ro
+      - ./spark_streaming/checkpoints:/opt/spark-checkpoints
+      - ./delta_lake:/opt/delta_lake
+
+  spark-silver:
+    image: apache/spark:3.5.5
+    container_name: streamguard-silver
+    depends_on:
+      spark:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /tmp/ivy2 /opt/delta_lake/silver/market_trades
+        /opt/spark-checkpoints/silver-market-trades &&
+        exec /opt/spark/bin/spark-submit
+        --master 'local[*]'
+        --conf spark.jars.ivy=/tmp/ivy2
+        --packages io.delta:delta-spark_2.12:3.2.0
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        /opt/spark-app/silver_processor.py
+    volumes:
+      - ./spark_streaming:/opt/spark-app:ro
+      - ./spark_streaming/checkpoints:/opt/spark-checkpoints
+      - ./delta_lake:/opt/delta_lake
+
+  spark-gold:
+    image: apache/spark:3.5.5
+    container_name: streamguard-gold
+    depends_on:
+      spark-silver:
+        condition: service_started
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        mkdir -p /tmp/ivy2 /opt/delta_lake/gold/market_metrics
+        /opt/spark-checkpoints/gold-market-metrics &&
+        exec /opt/spark/bin/spark-submit
+        --master 'local[*]'
+        --conf spark.jars.ivy=/tmp/ivy2
+        --packages io.delta:delta-spark_2.12:3.2.0
+        --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+        --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+        /opt/spark-app/gold_processor.py
+    volumes:
+      - ./spark_streaming:/opt/spark-app:ro
+      - ./spark_streaming/checkpoints:/opt/spark-checkpoints
+      - ./delta_lake:/opt/delta_lake
